@@ -20,14 +20,15 @@ import pc_util
 from model_util_scannet import rotate_aligned_boxes
 
 from model_util_scannet import ScannetDatasetConfig
+from models.model_util_vote import VoteConfig
 DC = ScannetDatasetConfig()
 MAX_NUM_OBJ = 64
 MEAN_COLOR_RGB = np.array([109.8, 97.2, 83.8])
 
-class ScannetDetectionDataset(Dataset):
+class ScannetDetectionDatasetMulti(Dataset):
        
     def __init__(self, split_set='train', num_points=20000,
-        use_color=False, use_height=False, augment=False):
+        use_color=False, use_height=False, augment=False, vote_config=VoteConfig()):
 
         self.data_path = os.path.join(BASE_DIR, 'scannet_train_detection_data')
         all_scan_names = list(set([os.path.basename(x)[0:12] \
@@ -53,6 +54,7 @@ class ScannetDetectionDataset(Dataset):
         self.use_color = use_color        
         self.use_height = use_height
         self.augment = augment
+        self.vote_config = vote_config
        
     def __len__(self):
         return len(self.scan_names)
@@ -146,7 +148,14 @@ class ScannetDetectionDataset(Dataset):
                 center = 0.5*(x.min(0) + x.max(0))
                 point_votes[ind, :] = center - x
                 point_votes_mask[ind] = 1.0
-        point_votes = np.tile(point_votes, (1, 3)) # make 3 votes identical 
+        
+        # add spatial label
+        votes_angle = np.arctan2(point_votes[:, 1], point_votes[:, 0])
+        votes_angle[votes_angle < 0.0] += 2*np.pi
+        votes_angle_cls = (votes_angle + np.pi / self.vote_config.num_heading_bin) / (2 * np.pi / self.vote_config.num_heading_bin)
+        votes_angle_cls = np.floor(votes_angle_cls) % self.vote_config.num_heading_bin
+        votes_angle_cls[point_votes[:, 2] < 0] += self.vote_config.num_heading_bin
+
         
         class_ind = [np.where(DC.nyu40ids == x)[0][0] for x in instance_bboxes[:,-1]]   
         # NOTE: set size class as semantic class. Consider use size2class.
@@ -167,6 +176,7 @@ class ScannetDetectionDataset(Dataset):
         ret_dict['sem_cls_label'] = target_bboxes_semcls.astype(np.int64)
         ret_dict['box_label_mask'] = target_bboxes_mask.astype(np.float32)
         ret_dict['vote_label'] = point_votes.astype(np.float32)
+        ret_dict['vote_label_cls'] = votes_angle_cls.astype(np.int64)
         ret_dict['vote_label_mask'] = point_votes_mask.astype(np.int64)
         ret_dict['scan_idx'] = np.array(idx).astype(np.int64)
         ret_dict['pcl_color'] = pcl_color
@@ -212,7 +222,7 @@ def viz_obb(pc, label, mask, angle_classes, angle_residuals,
 
     
 if __name__=='__main__': 
-    dset = ScannetDetectionDataset(use_height=True, num_points=40000)
+    dset = ScannetDetectionDatasetMulti(use_height=True, num_points=40000)
     for i_example in range(4):
         example = dset.__getitem__(1)
         pc_util.write_ply(example['point_clouds'], 'pc_{}.ply'.format(i_example))    

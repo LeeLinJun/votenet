@@ -35,12 +35,13 @@ ROOT_DIR = BASE_DIR
 sys.path.append(os.path.join(ROOT_DIR, 'utils'))
 sys.path.append(os.path.join(ROOT_DIR, 'pointnet2'))
 sys.path.append(os.path.join(ROOT_DIR, 'models'))
+from model_util_vote import VoteConfig
 from pytorch_utils import BNMomentumScheduler
 from tf_visualizer import Visualizer as TfVisualizer
 from ap_helper import APCalculator, parse_predictions, parse_groundtruths
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--model', default='votenet', help='Model file name [default: votenet]')
+parser.add_argument('--model', default='votenet_multi', help='Model file name [default: votenet_multi]')
 parser.add_argument('--dataset', default='sunrgbd', help='Dataset name. sunrgbd or scannet. [default: sunrgbd]')
 parser.add_argument('--num_workers', type=int, default=4, help='Number of workers for dataloader. [default: 4]')
 parser.add_argument('--checkpoint_path', default=None, help='Model checkpoint path [default: None]')
@@ -64,6 +65,13 @@ parser.add_argument('--use_color', action='store_true', help='Use RGB color in i
 parser.add_argument('--use_sunrgbd_v2', action='store_true', help='Use V2 box labels for SUN RGB-D dataset')
 parser.add_argument('--overwrite', action='store_true', help='Overwrite existing log and dump folders.')
 parser.add_argument('--dump_results', action='store_true', help='Dump results.')
+
+parser.add_argument('--num_heading_bin', type=int, required=True, help='num_heading_bin for spatial discrete')
+parser.add_argument('--top_n_votes', type=int, required=True, help='Top n votes')
+parser.add_argument('--vote_cls_loss_weight', type=float, required=True, help='vote_cls_loss_weight')
+parser.add_argument('--vote_cls_loss_weight_decay', default=False, action='store_true', help='enable vote_cls_loss_weight_decay')
+parser.add_argument('--vote_cls_loss_weight_decay_steps', default=None, type=str, help='vote_cls_loss_weight_decay_steps')
+parser.add_argument('--vote_cls_loss_weight_decay_rates', default=None, type=str, help='vote_cls_loss_weight_decay_rates')
 FLAGS = parser.parse_args()
 
 # ------------------------------------------------------------------------- GLOBAL CONFIG BEG
@@ -77,12 +85,20 @@ LR_DECAY_STEPS = [int(x) for x in FLAGS.lr_decay_steps.split(',')]
 LR_DECAY_RATES = [float(x) for x in FLAGS.lr_decay_rates.split(',')]
 assert(len(LR_DECAY_STEPS)==len(LR_DECAY_RATES))
 LOG_DIR = FLAGS.log_dir
-DEFAULT_DUMP_DIR = os.path.join(BASE_DIR, os.path.basename(LOG_DIR))
+DEFAULT_DUMP_DIR = os.path.join(LOG_DIR, 'dump')
 DUMP_DIR = FLAGS.dump_dir if FLAGS.dump_dir is not None else DEFAULT_DUMP_DIR
 DEFAULT_CHECKPOINT_PATH = os.path.join(LOG_DIR, 'checkpoint.tar')
 CHECKPOINT_PATH = FLAGS.checkpoint_path if FLAGS.checkpoint_path is not None \
     else DEFAULT_CHECKPOINT_PATH
 FLAGS.DUMP_DIR = DUMP_DIR
+
+# vote_cls_loss_weight
+VOTE_CLS_LOSS_WEIGHT_BASE = FLAGS.vote_cls_loss_weight
+if FLAGS.vote_cls_loss_weight_decay:
+    assert FLAGS.vote_cls_loss_weight_decay_steps is not None
+    assert FLAGS.vote_cls_loss_weight_decay_rates is not None
+    VOTE_CLS_LOSS_WEIGHT_DECAY_STEPS = [int(x) for x in FLAGS.vote_cls_loss_weight_decay_steps.split(',')]
+    VOTE_CLS_LOSS_WEIGHT_DECAY_RATES = [float(x) for x in FLAGS.vote_cls_loss_weight_decay_rates.split(',')]
 
 # Prepare LOG_DIR and DUMP_DIR
 if os.path.exists(LOG_DIR) and FLAGS.overwrite:
@@ -110,31 +126,39 @@ if not os.path.exists(DUMP_DIR): os.mkdir(DUMP_DIR)
 def my_worker_init_fn(worker_id):
     np.random.seed(np.random.get_state()[1][0] + worker_id)
 
+# Construct vote config
+VC = VoteConfig(num_heading_bin=FLAGS.num_heading_bin,
+                top_n_votes=FLAGS.top_n_votes)
+
 # Create Dataset and Dataloader
 if FLAGS.dataset == 'sunrgbd':
     sys.path.append(os.path.join(ROOT_DIR, 'sunrgbd'))
-    from sunrgbd_detection_dataset import SunrgbdDetectionVotesDataset, MAX_NUM_OBJ
+    from sunrgbd_detection_dataset_multi import SunrgbdDetectionVotesDatasetMulti, MAX_NUM_OBJ
     from model_util_sunrgbd import SunrgbdDatasetConfig
     DATASET_CONFIG = SunrgbdDatasetConfig()
-    TRAIN_DATASET = SunrgbdDetectionVotesDataset('train', num_points=NUM_POINT,
+    TRAIN_DATASET = SunrgbdDetectionVotesDatasetMulti('train', num_points=NUM_POINT,
         augment=True,
         use_color=FLAGS.use_color, use_height=(not FLAGS.no_height),
-        use_v1=(not FLAGS.use_sunrgbd_v2))
-    TEST_DATASET = SunrgbdDetectionVotesDataset('val', num_points=NUM_POINT,
+        use_v1=(not FLAGS.use_sunrgbd_v2),
+        vote_config=VC)
+    TEST_DATASET = SunrgbdDetectionVotesDatasetMulti('val', num_points=NUM_POINT,
         augment=False,
         use_color=FLAGS.use_color, use_height=(not FLAGS.no_height),
-        use_v1=(not FLAGS.use_sunrgbd_v2))
+        use_v1=(not FLAGS.use_sunrgbd_v2),
+        vote_config=VC)
 elif FLAGS.dataset == 'scannet':
     sys.path.append(os.path.join(ROOT_DIR, 'scannet'))
-    from scannet_detection_dataset import ScannetDetectionDataset, MAX_NUM_OBJ
+    from scannet_detection_dataset_multi import ScannetDetectionDatasetMulti, MAX_NUM_OBJ
     from model_util_scannet import ScannetDatasetConfig
     DATASET_CONFIG = ScannetDatasetConfig()
-    TRAIN_DATASET = ScannetDetectionDataset('train', num_points=NUM_POINT,
+    TRAIN_DATASET = ScannetDetectionDatasetMulti('train', num_points=NUM_POINT,
         augment=True,
-        use_color=FLAGS.use_color, use_height=(not FLAGS.no_height))
-    TEST_DATASET = ScannetDetectionDataset('val', num_points=NUM_POINT,
+        use_color=FLAGS.use_color, use_height=(not FLAGS.no_height),
+        vote_config=VC)
+    TEST_DATASET = ScannetDetectionDatasetMulti('val', num_points=NUM_POINT,
         augment=False,
-        use_color=FLAGS.use_color, use_height=(not FLAGS.no_height))
+        use_color=FLAGS.use_color, use_height=(not FLAGS.no_height),
+        vote_config=VC)
 else:
     print('Unknown dataset %s. Exiting...'%(FLAGS.dataset))
     exit(-1)
@@ -152,8 +176,10 @@ num_input_channel = int(FLAGS.use_color)*3 + int(not FLAGS.no_height)*1
 
 if FLAGS.model == 'boxnet':
     Detector = MODEL.BoxNet
-else:
+elif FLAGS.model == 'votenet':
     Detector = MODEL.VoteNet
+else:
+    Detector = MODEL.VoteNetMulti
 
 net = Detector(num_class=DATASET_CONFIG.num_class,
                num_heading_bin=DATASET_CONFIG.num_heading_bin,
@@ -161,7 +187,7 @@ net = Detector(num_class=DATASET_CONFIG.num_class,
                mean_size_arr=DATASET_CONFIG.mean_size_arr,
                num_proposal=FLAGS.num_target,
                input_feature_dim=num_input_channel,
-               vote_factor=FLAGS.vote_factor,
+               vote_config=VC,
                sampling=FLAGS.cluster_sampling)
 
 if torch.cuda.device_count() > 1:
@@ -203,6 +229,14 @@ def adjust_learning_rate(optimizer, epoch):
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
+def get_current_vote_cls_loss_weight(epoch):
+    weight = VOTE_CLS_LOSS_WEIGHT_BASE
+    if FLAGS.vote_cls_loss_weight_decay:
+        for i, wt_decay_epoch in enumerate(VOTE_CLS_LOSS_WEIGHT_DECAY_STEPS):
+            if epoch >= wt_decay_epoch:
+                weight *= VOTE_CLS_LOSS_WEIGHT_DECAY_RATES[i]
+    return weight
+
 # TFBoard Visualizers
 TRAIN_VISUALIZER = TfVisualizer(FLAGS, 'train')
 TEST_VISUALIZER = TfVisualizer(FLAGS, 'test')
@@ -220,6 +254,7 @@ def train_one_epoch():
     stat_dict = {} # collect statistics
     adjust_learning_rate(optimizer, EPOCH_CNT)
     bnm_scheduler.step() # decay BN momentum
+    vote_cls_loss_weight = get_current_vote_cls_loss_weight(EPOCH_CNT)
     net.train() # set model to training mode
     for batch_idx, batch_data_label in enumerate(TRAIN_DATALOADER):
         for key in batch_data_label:
@@ -234,13 +269,17 @@ def train_one_epoch():
         for key in batch_data_label:
             assert(key not in end_points)
             end_points[key] = batch_data_label[key]
+
+        # add vote_cls_loss_weight to end_points
+        end_points['vote_cls_loss_weight'] = vote_cls_loss_weight
+
         loss, end_points = criterion(end_points, DATASET_CONFIG)
         loss.backward()
         optimizer.step()
 
         # Accumulate statistics and print out
         for key in end_points:
-            if 'loss' in key or 'acc' in key or 'ratio' in key:
+            if ('loss' in key or 'acc' in key or 'ratio' in key) and key != 'vote_cls_loss_weight':
                 if key not in stat_dict: stat_dict[key] = 0
                 stat_dict[key] += end_points[key].item()
 
@@ -257,6 +296,7 @@ def evaluate_one_epoch():
     stat_dict = {} # collect statistics
     ap_calculator = APCalculator(ap_iou_thresh=FLAGS.ap_iou_thresh,
         class2type_map=DATASET_CONFIG.class2type)
+    vote_cls_loss_weight = get_current_vote_cls_loss_weight(EPOCH_CNT)
     net.eval() # set model to eval mode (for bn and dp)
     for batch_idx, batch_data_label in enumerate(TEST_DATALOADER):
         if batch_idx % 10 == 0:
@@ -268,6 +308,9 @@ def evaluate_one_epoch():
         inputs = {'point_clouds': batch_data_label['point_clouds']}
         end_points = net(inputs)
 
+        # add vote_cls_loss_weight to end_points
+        end_points['vote_cls_loss_weight'] = vote_cls_loss_weight
+
         # Compute loss
         for key in batch_data_label:
             assert(key not in end_points)
@@ -276,7 +319,7 @@ def evaluate_one_epoch():
 
         # Accumulate statistics and print out
         for key in end_points:
-            if 'loss' in key or 'acc' in key or 'ratio' in key:
+            if ('loss' in key or 'acc' in key or 'ratio' in key) and key != 'vote_cls_loss_weight':
                 if key not in stat_dict: stat_dict[key] = 0
                 stat_dict[key] += end_points[key].item()
 
